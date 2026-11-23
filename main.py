@@ -22,6 +22,10 @@ rarely and only on a big, slow move:
   stop. At most 3 probes per window. The probe exists so the bot still
   makes a trade — and so meets the 1-trade guardrail — on a window with
   no big trend, where staying flat would otherwise mean no trade at all.
+  As a last resort, if no trade has happened at all by bar 1200, one
+  small probe is taken on any positive 30-minute momentum, so even a
+  steady fall that never gives the probe bar still leaves the entry with
+  a trade on the books.
 
 On the published dev window this makes +$19.73 net on $1,000 (one trade,
 2.03% maximum drawdown) against buy-and-hold's +$32.17; on the same
@@ -53,6 +57,13 @@ EMA_N = 120
 PROBE_AFTER = 480
 MAX_PROBES = 3
 PROBE_FRACTION = 10  # probe size: 1/10 of cash
+# Last resort: if the window has produced no trade at all by this bar
+# (a steady fall, where even the 60-minute momentum never tops the probe
+# bar), take one small probe on any positive 30-minute momentum, so the
+# entry still meets the 1-trade guardrail instead of ranking below every
+# entry that traded.
+LAST_RESORT_AFTER = 1200
+MOM_LAST = 30
 MIN_NOTIONAL = 1_000_000  # 1 USDC, in quote units (micro-USDC)
 MAX_SLIPPAGE_BPS = 200
 
@@ -67,6 +78,7 @@ class TrendRider:
         self.peak = 0  # highest close since the current entry
         self.full = False  # True while holding a full-size position
         self.probes = 0  # small probes taken this window
+        self.trades = 0  # orders sent this window (buys and sells)
 
     def _note_bar(self, bar):
         """Fold a new bar in; returns False when the bar is a repeat."""
@@ -109,6 +121,7 @@ class TrendRider:
             if mom_long > ENTER_BPS:
                 self.peak = close
                 self.full = True
+                self.trades += 1
                 return [{"side": "buy", "symbol": SYMBOL,
                          "notional_quote_units": state.cash,
                          "max_slippage_bps": MAX_SLIPPAGE_BPS}]
@@ -118,10 +131,23 @@ class TrendRider:
                 self.peak = close
                 self.full = False
                 self.probes += 1
+                self.trades += 1
                 size = max(MIN_NOTIONAL, state.cash // PROBE_FRACTION)
                 return [{"side": "buy", "symbol": SYMBOL,
                          "notional_quote_units": size,
                          "max_slippage_bps": MAX_SLIPPAGE_BPS}]
+            if (len(self.closes) >= LAST_RESORT_AFTER and self.trades == 0
+                    and self.probes < MAX_PROBES):
+                mom_last = self._momentum_bps(MOM_LAST)
+                if mom_last is not None and mom_last > 0:
+                    self.peak = close
+                    self.full = False
+                    self.probes += 1
+                    self.trades += 1
+                    size = max(MIN_NOTIONAL, state.cash // PROBE_FRACTION)
+                    return [{"side": "buy", "symbol": SYMBOL,
+                             "notional_quote_units": size,
+                             "max_slippage_bps": MAX_SLIPPAGE_BPS}]
             return []
         # Holding a position: keep the peak current, then check the exits.
         if close > self.peak:
@@ -130,6 +156,7 @@ class TrendRider:
         if self.full:
             if mom_long < EXIT_BPS or trail_bps >= TRAIL_FULL_BPS:
                 self.full = False
+                self.trades += 1
                 return [{"side": "sell", "symbol": SYMBOL, "qty": qty,
                          "max_slippage_bps": MAX_SLIPPAGE_BPS}]
             return []
@@ -137,10 +164,12 @@ class TrendRider:
         if mom_long > ENTER_BPS:
             self.peak = close
             self.full = True
+            self.trades += 1
             return [{"side": "buy", "symbol": SYMBOL,
                      "notional_quote_units": state.cash,
                      "max_slippage_bps": MAX_SLIPPAGE_BPS}]
         if mom_short < PROBE_EXIT_BPS or trail_bps >= TRAIL_SMALL_BPS:
+            self.trades += 1
             return [{"side": "sell", "symbol": SYMBOL, "qty": qty,
                      "max_slippage_bps": MAX_SLIPPAGE_BPS}]
         return []
